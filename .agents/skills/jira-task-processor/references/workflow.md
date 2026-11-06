@@ -165,6 +165,7 @@ origin may download CDN bytes but do not receive Jira authentication.
   processing/        zero or one <KEY>.json, with owner token and claim time
   done/              uniquely named completed issue snapshots
   failed/            uniquely named failed snapshots and diagnostic metadata
+  excluded/          archived inbox snapshots for permanently excluded keys
   attachments/       <KEY>/<id>-<sha256>-<safe-filename>
   results/           <KEY>/analysis.md
   state.json         schema_version and issue last_seen/last_completed/last_failed
@@ -205,6 +206,11 @@ snapshot while preserving its initial FIFO queue time. An active snapshot is
 never replaced: changes arriving during analysis wait in inbox for the next
 conversation. Attachments are content-addressed so active paths remain stable.
 No automatic attachment retention/deletion policy is applied.
+Permanent exclusions are recorded per key in `state.json`; they take
+precedence over all timestamp/hash comparisons, retries, and selection.
+Fetch reports matching excluded keys in `excluded_issue_keys` without fetching
+their comments or downloading attachments. Restore requests force a new fetch
+of the current issue version, even if it is unchanged.
 
 Moves use atomic replacement and a write-ahead journal. If a script exits
 between a move and its state update, the next locked command finishes that
@@ -261,6 +267,58 @@ It refuses a retry of the same active issue, preserves an existing newer
 pending version, and refuses failures superseded by successful analysis.
 Fetch first if you want the latest Jira version rather than the failed one.
 
+## Permanently excluding tasks ("Won't do")
+
+To exclude an issue you will not analyze:
+
+```powershell
+python "$scripts\exclude_task.py" --issue-key DEMO-123
+# Optional nonsecret explanation:
+python "$scripts\exclude_task.py" --issue-key DEMO-456 --reason "Out of scope"
+```
+
+This is a **local permanent exclusion**, not a Jira status transition. It
+never contacts Jira or changes Jira labels, fields, assignee, or status.
+The issue disappears from the normal task list and both automatic and manual
+claims refuse it. Failed retries are also refused. Future Jira changes cannot
+put it back in inbox. You can exclude a key before its first fetch.
+Inbox snapshots are archived under `.jira-agent\excluded`; failed snapshots,
+attachments, previous reports, and completed history are retained for diagnosis.
+Repeated exclusion is idempotent and preserves the existing reason/timestamp.
+An active issue cannot be excluded; finish/fail it, or explicitly recover its
+stopped owner, before excluding it. A pending live label transition must finish
+first; exclusion never replays that Jira write. An interrupted local exclusion
+can be safely retried with the same exclusion command.
+
+To inspect the excluded keys:
+
+```powershell
+$list = python "$scripts\list_tasks.py" --include-excluded | ConvertFrom-Json
+$list.tasks | Format-Table issue_key, summary, queue_status, exclusion_reason, selectable
+```
+
+`--include-excluded` is a management view only. Excluded entries have
+`queue_status: excluded` and `selectable: false`; the response also reports
+`excluded_issue_count`. A key excluded before fetching may have no summary or
+snapshot path, since the script never invents Jira data.
+
+Only if you change your mind, explicitly restore the key:
+
+```powershell
+python "$scripts\exclude_task.py" --issue-key DEMO-123 --restore
+python "$scripts\fetch_jira_tasks.py"
+```
+
+Restore preserves the last exclusion for audit and requires a fresh fetch
+before selection/retry; it never queues an old archived snapshot directly.
+The next successful fetch queues the current matching Jira version even if
+its timestamp and content are unchanged. Nothing restores exclusions
+automatically. Use the same `--data-dir` for exclusion, listing, and all other
+operations.
+
+In OpenHands say "Exclude DEMO-123 from analysis, won't do." The skill
+performs the local exclusion and stops without analyzing it or touching Jira.
+
 ## Offline queue tests (no Jira or real issue processing)
 
 From the repository root:
@@ -277,6 +335,8 @@ failure/retry, stale recovery, credential redaction, and interrupted moves.
 They also cover listing pending/failed issues, explicit selection, deduplication,
 superseded failures, blocked selection, and read-only listing during a pending
 label transition.
+They also verify permanent exclusions, skipped downloads after Jira updates,
+blocked claims/retries, explicit restoration, and preservation of snapshots.
 Pure queue tests explicitly use `--no-jira-labels`; lifecycle integration
 tests write labels only to the loopback mock Jira, never to a real instance.
 Do not fabricate a successful report in the real queue just to test locking.

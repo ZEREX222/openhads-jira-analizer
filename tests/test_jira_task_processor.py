@@ -22,6 +22,7 @@ ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / ".agents" / "skills" / "jira-task-processor" / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 from _common import Store, TaskError, atomic_json, digest, read_json, redact
+from claim_next_task import main as claim_main
 from fetch_jira_tasks import SafeRedirect
 
 
@@ -498,6 +499,144 @@ class QueueTests(unittest.TestCase):
             self.assertEqual(set(jira["issues"][0]["fields"]["labels"]), {"offline", "ai-processing"})
             self.assertEqual(read_json(Path(selected["path"]))["retry_history"][0]["error"], "Choose this again")
 
+    def test_claim_token_is_safe_as_a_separate_cli_argument(self):
+        self.enqueue(snapshot())
+        with patch("claim_next_task.secrets.token_urlsafe", return_value="-leading-dash"):
+            with patch.object(sys, "argv", ["claim_next_task.py", "--data-dir",
+                                           str(self.data), "--no-jira-labels"]):
+                claim = claim_main()
+        self.assertTrue(claim["claim_token"].startswith("claim_"))
+        self.owned("fail_task.py", claim, "--error", "CLI-safe owner token")
+
+    def test_exclude_pending_permanently_hides_and_archives_without_analysis(self):
+        self.enqueue(snapshot("DEMO-1"))
+        self.enqueue(snapshot("DEMO-2"))
+        result = self.command("exclude_task.py", "--issue-key", "DEMO-1")
+        self.assertEqual(result["status"], "excluded")
+        exclusion = result["exclusion"]
+        self.assertEqual(exclusion["reason"], "Won't do")
+        self.assertFalse((self.data / "inbox" / "DEMO-1.json").exists())
+        self.assertTrue((self.data / exclusion["snapshot_path"]).exists())
+        self.assertEqual(self.enqueue(snapshot("DEMO-1", content="changed")), "excluded")
+        self.command("claim_next_task.py", "--issue-key", "DEMO-1", expected=1)
+        self.assertEqual(self.command("list_tasks.py")["counts"], {"pending": 1, "failed": 0})
+        listing = self.command("list_tasks.py", "--include-excluded")
+        excluded = next(task for task in listing["tasks"] if task["issue_key"] == "DEMO-1")
+        self.assertEqual(excluded["queue_status"], "excluded")
+        self.assertFalse(excluded["selectable"])
+        self.assertEqual(excluded["exclusion_reason"], "Won't do")
+        self.assertEqual(listing["excluded_issue_count"], 1)
+        repeated = self.command("exclude_task.py", "--issue-key", "DEMO-1")
+        self.assertEqual(repeated["status"], "already_excluded")
+        self.assertEqual(repeated["exclusion"], exclusion)
+        self.assertEqual(self.claim()["issue_key"], "DEMO-2")
+
+    def test_exclude_failed_blocks_retry_and_keeps_failure_evidence(self):
+        self.enqueue(snapshot())
+        claim = self.claim()
+        failure = self.owned("fail_task.py", claim, "--error", "Retain this diagnostic")
+        self.command("exclude_task.py", "--issue-key", "DEMO-1", "--reason", "Not my project")
+        self.assertTrue(Path(failure["path"]).exists())
+        self.assertEqual(self.command("list_tasks.py")["status"], "empty")
+        self.command("fail_task.py", "--retry", "DEMO-1", expected=1)
+        self.command("claim_next_task.py", "--issue-key", "DEMO-1", expected=1)
+        self.command("exclude_task.py", "--issue-key", "DEMO-1", "--restore")
+        self.assertEqual(self.command("list_tasks.py")["status"], "empty")
+        self.command("fail_task.py", "--retry", "DEMO-1", expected=1)
+        self.assertEqual(self.enqueue(snapshot()), "updated")
+        self.assertEqual(self.claim()["status"], "claimed")
+
+    def test_excluded_jira_issue_skips_comments_attachments_and_all_future_updates(self):
+        with mock_jira() as jira:
+            self.env["JIRA_URL"] = jira["base"]
+            self.command("exclude_task.py", "--issue-key", "DEMO-1")
+            self.assertEqual(jira["requests"], [])
+            self.assertEqual(jira["writes"], [])
+            result = self.command("fetch_jira_tasks.py", "--allow-http")
+            self.assertEqual(result["new_issue_keys"], [])
+            self.assertEqual(result["excluded_issue_keys"], ["DEMO-1"])
+            jira["issues"][0]["fields"]["summary"] = "Changed after exclusion"
+            jira["issues"][0]["fields"]["updated"] = "2026-01-02T00:00:00.000+0000"
+            jira["attachment"] = b"new content"
+            result = self.command("fetch_jira_tasks.py", "--allow-http")
+            self.assertEqual(result["updated_issue_keys"], [])
+            self.assertEqual(result["excluded_issue_keys"], ["DEMO-1"])
+            self.assertFalse(any("/comment" in path or "/attachment/" in path for path, _, _ in jira["requests"]))
+            self.assertFalse(list((self.data / "attachments").rglob("*")))
+            self.assertEqual(self.command("list_tasks.py")["status"], "empty")
+            restore = self.command("exclude_task.py", "--issue-key", "DEMO-1", "--restore")
+            self.assertTrue(restore["needs_fetch"])
+            self.assertEqual(jira["writes"], [])
+            self.command("claim_next_task.py", "--issue-key", "DEMO-1", expected=1)
+            fetched = self.command("fetch_jira_tasks.py", "--allow-http")
+            self.assertEqual(fetched["new_issue_keys"], ["DEMO-1"])
+            self.assertEqual(read_json(self.data / "inbox" / "DEMO-1.json")["summary"], "Changed after exclusion")
+
+    def test_restore_forces_unchanged_completed_issue_to_be_fetched_again(self):
+        self.enqueue(snapshot())
+        claim = self.claim()
+        self.write_report(claim)
+        self.owned("complete_task.py", claim)
+        original_completed = read_json(self.data / "state.json")["issues"]["DEMO-1"]["last_completed"]
+        self.command("exclude_task.py", "--issue-key", "DEMO-1")
+        self.command("exclude_task.py", "--issue-key", "DEMO-1", "--restore")
+        self.assertEqual(self.enqueue(snapshot()), "updated")
+        state = read_json(self.data / "state.json")["issues"]["DEMO-1"]
+        self.assertNotIn("requeue_requested", state)
+        self.assertNotIn("excluded", state)
+        self.assertEqual(state["last_completed"], original_completed)
+        self.assertEqual(state["last_exclusion"]["reason"], "Won't do")
+        self.assertEqual(self.claim()["issue_key"], "DEMO-1")
+
+    def test_exclusion_refuses_active_issue_and_does_not_replay_live_transition(self):
+        self.enqueue(snapshot())
+        claim = self.claim()
+        self.command("exclude_task.py", "--issue-key", "DEMO-1", expected=1)
+        self.assertTrue(Path(claim["path"]).exists())
+        self.assertNotIn("excluded", read_json(self.data / "state.json")["issues"]["DEMO-1"])
+        with mock_jira() as jira:
+            self.env["JIRA_URL"] = jira["base"]
+            self.data = Path(self.temporary.name) / "pending-live-label"
+            self.command("fetch_jira_tasks.py", "--allow-http")
+            jira["label_error"] = 403
+            self.command("claim_next_task.py", "--allow-http", labels=True, expected=1)
+            requests, writes = len(jira["requests"]), len(jira["writes"])
+            journal = (self.data / ".transition.json").read_bytes()
+            self.command("exclude_task.py", "--issue-key", "DEMO-1", expected=1)
+            self.assertEqual(len(jira["requests"]), requests)
+            self.assertEqual(len(jira["writes"]), writes)
+            self.assertEqual((self.data / ".transition.json").read_bytes(), journal)
+
+    def test_interrupted_local_exclusion_can_be_retried_without_jira(self):
+        self.enqueue(snapshot())
+        state = read_json(self.data / "state.json")
+        destination = self.data / "excluded" / "DEMO-1-offline.json"
+        state["issues"]["DEMO-1"]["excluded"] = {
+            "excluded_at": datetime.now(timezone.utc).isoformat(), "reason": "Won't do",
+            "summary": "Synthetic issue", "updated": snapshot()["updated"],
+            "snapshot_path": str(destination.relative_to(self.data)),
+        }
+        atomic_json(self.data / ".transition.json", {
+            "source": str(Path("inbox") / "DEMO-1.json"),
+            "destination": str(destination.relative_to(self.data)), "state": state,
+        })
+        result = self.command("exclude_task.py", "--issue-key", "DEMO-1")
+        self.assertEqual(result["status"], "already_excluded")
+        self.assertTrue(destination.exists())
+        self.assertFalse((self.data / ".transition.json").exists())
+        self.assertEqual(self.command("list_tasks.py")["status"], "empty")
+
+    def test_exclusion_validates_inputs_and_redacts_reasons(self):
+        self.command("exclude_task.py", "--issue-key", "../unsafe", expected=1)
+        self.command("exclude_task.py", "--issue-key", "DEMO-1", "--reason", " ", expected=1)
+        self.command("exclude_task.py", "--issue-key", "DEMO-1",
+                     "--restore", "--reason", "Invalid combination", expected=1)
+        self.command("exclude_task.py", "--issue-key", "DEMO-1", "--restore", expected=1)
+        result = self.command("exclude_task.py", "--issue-key", "DEMO-1",
+                              "--reason", "fake-token-not-real fake-account")
+        self.assertNotIn("fake-token-not-real", json.dumps(result))
+        self.assertNotIn("fake-account", (self.data / "state.json").read_text(encoding="utf-8"))
+
     def test_jira_label_lifecycle_preserves_other_labels_and_does_not_requeue(self):
         with mock_jira() as jira:
             self.env["JIRA_URL"] = jira["base"]
@@ -599,7 +738,8 @@ class SkillStructureTests(unittest.TestCase):
         skill = SCRIPTS.parent
         for relative in ("SKILL.md", "references/workflow.md",
                          "scripts/fetch_jira_tasks.py", "scripts/claim_next_task.py",
-                         "scripts/complete_task.py", "scripts/fail_task.py", "scripts/list_tasks.py"):
+                         "scripts/complete_task.py", "scripts/fail_task.py", "scripts/list_tasks.py",
+                         "scripts/exclude_task.py"):
             self.assertTrue((skill / relative).is_file(), relative)
         text = (skill / "SKILL.md").read_text(encoding="utf-8")
         frontmatter = text.split("---", 2)

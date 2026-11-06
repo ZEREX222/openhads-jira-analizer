@@ -1,6 +1,6 @@
 ---
 name: jira-task-processor
-description: List assigned pending and failed Jira issues for user selection, then analyze exactly one selected issue against its local Git project using a deterministic Python queue. Use when asked to list, choose, process, investigate, or propose a solution for assigned Jira tasks.
+description: List, choose, or permanently exclude assigned Jira issues, then analyze exactly one selected issue against its local Git project using a deterministic Python queue. Use when asked to list, exclude, choose, process, investigate, or propose a solution for Jira tasks.
 ---
 
 # Jira task processor
@@ -30,6 +30,21 @@ operation, API compatibility, recovery, and offline tests.
 
 ## Workflow (one issue only)
 
+If the user asks to exclude a key from analysis ("won't do", "do not analyze",
+"exclude permanently"), run
+`python <scripts>/exclude_task.py --issue-key <KEY>` with the same data root.
+Use `--reason "<nonsecret reason>"` if the user provides a reason; the default
+is `Won't do`. Confirm `excluded` or `already_excluded`, then stop. Do not fetch,
+claim, analyze, or complete that issue as part of exclusion. For multiple
+explicit keys, apply the command separately to each and report any failures.
+Exclusion is permanent across Jira updates and affects only this local queue:
+never interpret "won't do" as permission to transition Jira to a Won't Do status.
+Active claims cannot be excluded; do not bypass their owner or remove locks.
+Show excluded keys only on request using `list_tasks.py --include-excluded`.
+Restore a key only on explicit request with
+`exclude_task.py --issue-key <KEY> --restore`; then fetch before selecting it.
+Never automatically restore an exclusion or edit `state.json` yourself.
+
 1. Run `python <scripts>/fetch_jira_tasks.py`. Parse its JSON summary. If it
    exits nonzero or reports errors, report the errors without credentials and
    stop; any successfully downloaded issues remain queued for a later run.
@@ -42,6 +57,9 @@ operation, API compatibility, recovery, and offline tests.
    reported, stop and request operator recovery. If there are no tasks, report
    that no new, updated, or retryable failed issues are available and stop.
    If the user only asked for a list, **stop after showing it**.
+   Excluded tasks are omitted from this list and cannot be selected, even if
+   they changed in Jira. `--include-excluded` is a management view only;
+   excluded rows always have `selectable: false`.
    If the user already supplied an issue key, use it exactly. Otherwise ask
    the user to choose a key and **wait without claiming**. Only when the user
    explicitly requests automatic/oldest-first processing may you bypass
@@ -150,6 +168,8 @@ The most practical next implementation step.
   ownership to parallel agents.
 - Never bypass the scripts by moving queue files or editing `state.json`.
 - Never automatically retry failed issues or recover a stale owner.
+- Respect permanent exclusions; never restore or analyze them without an
+  explicit user request to restore.
 - Never choose a different issue when the selected key is unavailable. Refresh
   the deterministic list and ask the user to select again.
 - Do not invent missing Jira data, attachment contents, or source-code behavior.

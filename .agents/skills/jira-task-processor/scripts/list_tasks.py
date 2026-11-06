@@ -9,6 +9,8 @@ def main():
     args_parser = parser(__doc__)
     args_parser.add_argument("--pending-only", action="store_true",
                              help="Exclude failed issues; default includes retryable failures.")
+    args_parser.add_argument("--include-excluded", action="store_true",
+                             help="Also display permanently excluded keys as nonselectable.")
     args = args_parser.parse_args()
     # Listing must not replay a pending remote write or claim an issue while
     # the operator is deciding which task to process.
@@ -38,11 +40,25 @@ def main():
                 "priority": (task.get("priority") or {}).get("name"),
                 "updated": task["updated"], "path": str(path), "selectable": can_claim,
                 "failure": task.get("failure") if status == "failed" else None,
+                "exclusion_reason": None,
             })
+        exclusions = {key: record["excluded"] for key, record in store.state["issues"].items()
+                      if record.get("excluded")}
+        if args.include_excluded:
+            counts["excluded"] = len(exclusions)
+            for key, exclusion in sorted(exclusions.items()):
+                path = exclusion.get("snapshot_path")
+                tasks.append({
+                    "issue_key": key, "summary": exclusion["summary"], "queue_status": "excluded",
+                    "jira_status": None, "priority": None, "updated": exclusion["updated"],
+                    "path": str(store.relative_path(path)) if path else None,
+                    "selectable": False, "failure": None, "exclusion_reason": exclusion["reason"],
+                })
         return redact_data({
             "status": "blocked" if errors else "listed" if tasks or active else "empty",
             "tasks": tasks, "counts": counts, "processing": active,
             "can_claim": can_claim, "transition_pending": transition_pending, "errors": errors,
+            "excluded_issue_count": len(exclusions),
         })
 
 

@@ -28,6 +28,7 @@ def main():
             return {"status": "failed", "issue_key": task["key"], "path": str(path), "errors": []}
         if args.retry:
             key = key_checked(args.retry)
+            store.require_included(key)
             processing = store.processing()
             if processing and read_json(processing)["key"] == key:
                 raise TaskError("This issue is already processing; do not retry it concurrently.")

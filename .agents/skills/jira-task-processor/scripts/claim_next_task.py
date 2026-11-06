@@ -29,6 +29,8 @@ def main():
         if args.recover_stale:
             raise TaskError("--issue-key cannot be combined with --recover-stale.")
     with Store(args.data_dir).locked() as store:
+        if args.issue_key:
+            store.require_included(args.issue_key)
         existing = store.processing()
         if args.recover_stale:
             key_checked(args.recover_stale)
@@ -75,7 +77,7 @@ def main():
         key_checked(task["key"])
         if status == "failed":
             prepare_retry(task)
-        token = secrets.token_urlsafe(32)
+        token = "claim_" + secrets.token_urlsafe(32)
         task["claim"] = {"token": token, "claimed_at": now(), "delivered": False}
         destination = store.root / "processing" / f'{task["key"]}.json'
         store.move(pending, destination, task, label_change(args, task, "ai-processing"))

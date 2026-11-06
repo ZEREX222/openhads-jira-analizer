@@ -127,7 +127,7 @@ def atomic_json(path, value):
 
 
 class Store:
-    directories = ("inbox", "processing", "done", "failed", "attachments", "results")
+    directories = ("inbox", "processing", "done", "failed", "excluded", "attachments", "results")
 
     def __init__(self, root):
         self.root = root.resolve()
@@ -270,11 +270,22 @@ class Store:
         completed = self.state["issues"].get(task["key"], {}).get("last_completed")
         return bool(completed and completed["completed_at"] >= task["failure"]["failed_at"])
 
+    def is_excluded(self, key):
+        return bool(self.state["issues"].get(key, {}).get("excluded"))
+
+    def require_included(self, key):
+        if self.is_excluded(key):
+            raise TaskError("This issue is permanently excluded; restore it explicitly before selecting.")
+        if self.state["issues"].get(key, {}).get("requeue_requested"):
+            raise TaskError("Restored issue needs a fresh fetch before selection or retry.")
+
     def available_tasks(self, include_failed=True):
         candidates = {}
         for path in (self.root / "inbox").glob("*.json"):
             task = read_json(path)
             key = key_checked(task["key"])
+            if self.is_excluded(key) or self.state["issues"].get(key, {}).get("requeue_requested"):
+                continue
             if path.stem != key or key in candidates:
                 raise TaskError("Invalid or duplicate inbox snapshot; repair the queue.")
             candidates[key] = (path, task, "pending")
@@ -282,7 +293,9 @@ class Store:
         active_key = read_json(processing)["key"] if processing else None
         if include_failed:
             for key, (path, task) in self.latest_failures().items():
-                if key not in candidates and key != active_key and not self.failure_superseded(task):
+                if (key not in candidates and key != active_key and not self.failure_superseded(task)
+                        and not self.is_excluded(key)
+                        and not self.state["issues"].get(key, {}).get("requeue_requested")):
                     candidates[key] = (path, task, "failed")
         return sorted(candidates.values(), key=lambda item: (
             item[1]["queued_at"] if item[2] == "pending" else item[1]["failure"]["failed_at"],
@@ -291,9 +304,11 @@ class Store:
     def enqueue(self, issue):
         key = key_checked(issue["key"])
         current = self.state["issues"].setdefault(key, {})
+        if self.is_excluded(key):
+            return "excluded"
         version = {"updated": issue["updated"], "content_hash": issue["content_hash"]}
         seen = current.get("last_seen")
-        if seen == version:
+        if seen == version and not current.get("requeue_requested"):
             return "unchanged"
         path = self.root / "inbox" / f"{key}.json"
         # A crash after writing the snapshot but before state.json is harmless:
@@ -301,6 +316,7 @@ class Store:
         issue["queued_at"] = read_json(path)["queued_at"] if path.exists() else now()
         atomic_json(path, issue)
         current["last_seen"] = version
+        current.pop("requeue_requested", None)
         self.save()
         return "updated" if seen else "new"
 

@@ -305,7 +305,8 @@ def main():
                              help="GET myself only; do not create runtime files or queue issues.")
     args_parser.add_argument("--max-attachment-bytes", type=int, default=100 * 1024 * 1024)
     args = args_parser.parse_args()
-    summary = {"new_issue_keys": [], "updated_issue_keys": [], "unchanged_issue_count": 0, "errors": []}
+    summary = {"new_issue_keys": [], "updated_issue_keys": [], "unchanged_issue_count": 0,
+               "excluded_issue_keys": [], "errors": []}
     try:
         if args.max_attachment_bytes <= 0:
             raise TaskError("Attachment size limit must be positive.")
@@ -332,6 +333,9 @@ def main():
                     if key in seen:
                         raise TaskError("Search returned the same issue twice; fetch again.")
                     seen.add(key)
+                    if store.is_excluded(key):
+                        summary["excluded_issue_keys"].append(key)
+                        continue
                     issue = normalize(jira, raw, version, store, args.max_attachment_bytes)
                     change = store.enqueue(issue)
                     if change == "unchanged":
