@@ -9,6 +9,10 @@ Use `list_tasks.py` to list pending and failed issues, then
 `claim_next_task.py --issue-key <KEY>` to select one. OpenHands shows the list
 and waits for your selection unless automatic oldest-first processing is
 explicitly requested.
+Only issues in `NEW`, `PAUSED`, `TO DO`, or `REOPENED` are eligible, including
+updated issues and failed retries. Fetch before listing to hide cached issues
+that have left the eligible Jira selection. Custom JQL cannot bypass the status
+filter.
 Use `exclude_task.py --issue-key <KEY>` to permanently exclude a task from
 analysis ("Won't do"). It stays excluded after Jira updates and is hidden from
 selection; no Jira status or labels are changed. `list_tasks.py --include-excluded`

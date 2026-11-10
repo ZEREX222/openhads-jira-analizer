@@ -81,6 +81,13 @@ def parser(description, labels=False):
 
 
 AI_LABELS = frozenset(("ai-processing", "ai-processed", "ai-failed"))
+ALLOWED_STATUSES = ("NEW", "PAUSED", "TO DO", "REOPENED")
+
+
+def has_allowed_status(issue):
+    status = issue.get("status")
+    name = status.get("name") if isinstance(status, dict) else None
+    return isinstance(name, str) and name.strip().upper() in ALLOWED_STATUSES
 
 
 def label_change(args, task, target):
@@ -278,13 +285,25 @@ class Store:
             raise TaskError("This issue is permanently excluded; restore it explicitly before selecting.")
         if self.state["issues"].get(key, {}).get("requeue_requested"):
             raise TaskError("Restored issue needs a fresh fetch before selection or retry.")
+        if self.state["issues"].get(key, {}).get("in_scope") is False:
+            raise TaskError("This issue is outside the latest Jira selection; fetch and list tasks again.")
+
+    def refresh_scope(self, keys):
+        for key, record in self.state["issues"].items():
+            record["in_scope"] = key in keys
+        self.save()
+
+    def is_available(self, task):
+        record = self.state["issues"].get(task["key"], {})
+        return (has_allowed_status(task) and not record.get("excluded")
+                and not record.get("requeue_requested") and record.get("in_scope") is not False)
 
     def available_tasks(self, include_failed=True):
         candidates = {}
         for path in (self.root / "inbox").glob("*.json"):
             task = read_json(path)
             key = key_checked(task["key"])
-            if self.is_excluded(key) or self.state["issues"].get(key, {}).get("requeue_requested"):
+            if not self.is_available(task):
                 continue
             if path.stem != key or key in candidates:
                 raise TaskError("Invalid or duplicate inbox snapshot; repair the queue.")
@@ -294,8 +313,7 @@ class Store:
         if include_failed:
             for key, (path, task) in self.latest_failures().items():
                 if (key not in candidates and key != active_key and not self.failure_superseded(task)
-                        and not self.is_excluded(key)
-                        and not self.state["issues"].get(key, {}).get("requeue_requested")):
+                        and self.is_available(task)):
                     candidates[key] = (path, task, "failed")
         return sorted(candidates.values(), key=lambda item: (
             item[1]["queued_at"] if item[2] == "pending" else item[1]["failure"]["failed_at"],

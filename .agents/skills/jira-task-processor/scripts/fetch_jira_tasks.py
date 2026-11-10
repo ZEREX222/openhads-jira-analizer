@@ -12,10 +12,12 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, urljoin, urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
-from _common import AI_LABELS, Store, TaskError, atomic_json, digest, key_checked, now, parser, redact, redact_data, run
+from _common import AI_LABELS, ALLOWED_STATUSES, Store, TaskError, atomic_json, digest, has_allowed_status, key_checked, now, parser, redact, redact_data, run
 
 
-DEFAULT_JQL = "assignee = currentUser() AND statusCategory != Done ORDER BY updated ASC"
+DEFAULT_JQL = ('assignee = currentUser() AND status IN ('
+               + ", ".join(f'"{status}"' for status in ALLOWED_STATUSES)
+               + ') ORDER BY updated ASC')
 FIELDS = ("summary,description,status,priority,issuetype,assignee,reporter,"
           "labels,components,created,updated,attachment")
 
@@ -306,7 +308,7 @@ def main():
     args_parser.add_argument("--max-attachment-bytes", type=int, default=100 * 1024 * 1024)
     args = args_parser.parse_args()
     summary = {"new_issue_keys": [], "updated_issue_keys": [], "unchanged_issue_count": 0,
-               "excluded_issue_keys": [], "errors": []}
+               "excluded_issue_keys": [], "skipped_status_issue_keys": [], "errors": []}
     try:
         if args.max_attachment_bytes <= 0:
             raise TaskError("Attachment size limit must be positive.")
@@ -326,6 +328,7 @@ def main():
             raise TaskError("JIRA_JQL must not be empty.")
         with Store(args.data_dir).locked() as store:
             seen = set()
+            eligible = set()
             for raw in jira.issues(jql, version):
                 key = raw.get("key")
                 try:
@@ -336,6 +339,10 @@ def main():
                     if store.is_excluded(key):
                         summary["excluded_issue_keys"].append(key)
                         continue
+                    if not has_allowed_status(raw.get("fields", {})):
+                        summary["skipped_status_issue_keys"].append(key)
+                        continue
+                    eligible.add(key)
                     issue = normalize(jira, raw, version, store, args.max_attachment_bytes)
                     change = store.enqueue(issue)
                     if change == "unchanged":
@@ -345,6 +352,8 @@ def main():
                 except TaskError as exc:
                     summary["errors"].append({"issue_key": key if isinstance(key, str) else None,
                                               "error": redact(exc)})
+            # Only a fully enumerated search can retire missing cached tasks.
+            store.refresh_scope(eligible)
     except TaskError as exc:
         summary["errors"].append({"error": redact(exc)})
     return summary

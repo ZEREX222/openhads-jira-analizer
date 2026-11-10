@@ -31,7 +31,7 @@ def raw_issue(key="DEMO-1", updated="2026-01-01T00:00:00.000+0000"):
         "key": key,
         "fields": {
             "summary": "Synthetic attachment test", "description": {"type": "doc", "content": []},
-            "status": {"id": "1", "name": "Open", "statusCategory": {"key": "new"}},
+            "status": {"id": "1", "name": "NEW", "statusCategory": {"key": "new"}},
             "priority": {"name": "High"}, "issuetype": {"name": "Bug"},
             "assignee": {"accountId": "fake-1", "displayName": "Synthetic"},
             "reporter": None, "labels": ["offline"], "components": [{"id": "1", "name": "Demo"}],
@@ -43,7 +43,8 @@ def raw_issue(key="DEMO-1", updated="2026-01-01T00:00:00.000+0000"):
 
 def snapshot(key="DEMO-1", updated="2026-01-01T00:00:00+00:00", content="one"):
     task = {"key": key, "summary": "Synthetic issue", "updated": updated,
-            "content_hash": digest(content), "comments": [], "attachments": []}
+            "content_hash": digest(content), "comments": [], "attachments": [],
+            "status": {"name": "NEW"}}
     task["version_id"] = digest({"updated": updated, "content_hash": task["content_hash"]})
     return task
 
@@ -55,7 +56,7 @@ def mock_jira(api_version="3"):
              "attachment": b"synthetic attachment", "requests": [], "attachment_error": False,
              "declared_size": None, "changed_during_fetch": False,
              "writes": [], "label_error": None, "label_error_after_apply": False,
-             "update_counter": 0, "edit_during_label_write": False}
+             "update_counter": 0, "edit_during_label_write": False, "search_error_at": None}
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *args):
@@ -69,6 +70,9 @@ def mock_jira(api_version="3"):
                 response = {"accountId": "synthetic-only"}
             elif path.path in ("/rest/api/3/search/jql", "/rest/api/2/search"):
                 index = int(parameters.get("nextPageToken", parameters.get("startAt", ["0"]))[0])
+                if index == state["search_error_at"]:
+                    self.send_error(503)
+                    return
                 page = deepcopy(state["issues"][index:index + 1])
                 for issue in page:
                     issue["fields"]["attachment"] = [{
@@ -370,6 +374,129 @@ class QueueTests(unittest.TestCase):
             self.assertEqual(len(error["errors"]), 2)
             self.assertEqual(read_json(self.data / "inbox" / "DEMO-1.json")["comments"][0]["body"], "first")
 
+    def test_fetch_filters_exact_statuses_even_with_custom_jql(self):
+        with mock_jira() as jira:
+            self.env["JIRA_URL"] = jira["base"]
+            names = ("NEW", "PAUSED", "TO DO", "REOPENED", " new ", "To Do",
+                     "Open", "In Progress", "Done", "Closed", "NEW REVIEW")
+            jira["issues"] = []
+            for index, name in enumerate(names, 1):
+                issue = raw_issue(f"DEMO-{index}")
+                issue["fields"]["status"]["name"] = name
+                jira["issues"].append(issue)
+            result = self.command("fetch_jira_tasks.py", "--allow-http")
+            expected_keys = [f"DEMO-{index}" for index in range(1, 7)]
+            self.assertEqual(result["new_issue_keys"], expected_keys)
+            self.assertEqual(result["skipped_status_issue_keys"],
+                             [f"DEMO-{index}" for index in range(7, 12)])
+            query = next(params["jql"][0] for path, params, _ in jira["requests"]
+                         if path == "/rest/api/3/search/jql")
+            self.assertEqual(query, 'assignee = currentUser() AND status IN '
+                             '("NEW", "PAUSED", "TO DO", "REOPENED") ORDER BY updated ASC')
+            self.assertEqual(sorted(task["issue_key"] for task in self.command("list_tasks.py")["tasks"]),
+                             expected_keys)
+            self.assertEqual(sum(path.endswith("/comment") for path, _, _ in jira["requests"]), 12)
+            self.env["JIRA_JQL"] = "assignee = currentUser() ORDER BY updated ASC"
+            repeated = self.command("fetch_jira_tasks.py", "--allow-http")
+            self.assertEqual(repeated["unchanged_issue_count"], 6)
+            self.assertEqual(repeated["skipped_status_issue_keys"], result["skipped_status_issue_keys"])
+            self.assertEqual(len(list((self.data / "inbox").glob("*.json"))), 6)
+            self.assertEqual(jira["writes"], [])
+
+    def test_updated_completed_issue_only_returns_in_allowed_status(self):
+        with mock_jira() as jira:
+            self.env["JIRA_URL"] = jira["base"]
+            self.command("fetch_jira_tasks.py", "--allow-http")
+            claim = self.claim()
+            self.write_report(claim)
+            self.owned("complete_task.py", claim)
+            fields = jira["issues"][0]["fields"]
+            fields["status"]["name"] = "In Progress"
+            fields["updated"] = "2026-01-02T00:00:00.000+0000"
+            result = self.command("fetch_jira_tasks.py", "--allow-http")
+            self.assertEqual(result["updated_issue_keys"], [])
+            self.assertEqual(result["skipped_status_issue_keys"], ["DEMO-1"])
+            self.assertEqual(self.command("list_tasks.py")["status"], "empty")
+            self.assertEqual(self.claim()["status"], "empty")
+            fields["status"]["name"] = "REOPENED"
+            fields["updated"] = "2026-01-03T00:00:00.000+0000"
+            self.assertEqual(self.command("fetch_jira_tasks.py", "--allow-http")["updated_issue_keys"],
+                             ["DEMO-1"])
+            self.assertEqual(self.command("list_tasks.py")["tasks"][0]["jira_status"], "REOPENED")
+
+    def test_refresh_hides_cached_pending_and_failed_missing_from_search(self):
+        for api_version in ("2", "3"):
+            with self.subTest(api_version=api_version), mock_jira(api_version) as jira:
+                self.data = Path(self.temporary.name) / f"runtime-{api_version}"
+                self.env["JIRA_URL"] = jira["base"]
+                jira["issues"].append(raw_issue("DEMO-2"))
+                self.command("fetch_jira_tasks.py", "--allow-http")
+                claim = self.claim()
+                failure = self.owned("fail_task.py", claim, "--error", "Preserve failure evidence")
+                original_issues = deepcopy(jira["issues"])
+                jira["issues"] = []
+                self.command("fetch_jira_tasks.py", "--allow-http")
+                self.assertEqual(self.command("list_tasks.py")["status"], "empty")
+                self.assertEqual(self.claim()["status"], "empty")
+                for key in ("DEMO-1", "DEMO-2"):
+                    self.command("claim_next_task.py", "--issue-key", key, expected=1)
+                    self.command("fail_task.py", "--retry", key, expected=1)
+                self.assertTrue(Path(failure["path"]).exists())
+                self.assertTrue((self.data / "inbox" / "DEMO-2.json").exists())
+                jira["issues"] = original_issues
+                self.command("fetch_jira_tasks.py", "--allow-http")
+                self.assertEqual(self.command("list_tasks.py")["counts"], {"pending": 1, "failed": 1})
+
+    def test_disallowed_status_hides_cached_issue_and_preserves_active_owner(self):
+        with mock_jira() as jira:
+            self.env["JIRA_URL"] = jira["base"]
+            self.command("fetch_jira_tasks.py", "--allow-http")
+            claim = self.claim()
+            jira["issues"][0]["fields"]["summary"] = "Updated while processing"
+            self.command("fetch_jira_tasks.py", "--allow-http")
+            self.assertEqual(self.command("list_tasks.py")["counts"]["pending"], 1)
+            active_before = Path(claim["path"]).read_bytes()
+            jira["issues"][0]["fields"]["status"]["name"] = "In Progress"
+            self.command("fetch_jira_tasks.py", "--allow-http")
+            listing = self.command("list_tasks.py")
+            self.assertEqual(listing["tasks"], [])
+            self.assertEqual(listing["processing"]["issue_key"], claim["issue_key"])
+            self.assertEqual(Path(claim["path"]).read_bytes(), active_before)
+            self.write_report(claim)
+            self.owned("complete_task.py", claim)
+            self.assertEqual(self.command("list_tasks.py")["status"], "empty")
+
+    def test_incomplete_search_does_not_hide_unseen_cached_tasks(self):
+        with mock_jira() as jira:
+            self.env["JIRA_URL"] = jira["base"]
+            jira["issues"].append(raw_issue("DEMO-2"))
+            self.command("fetch_jira_tasks.py", "--allow-http")
+            state_before = (self.data / "state.json").read_bytes()
+            jira["search_error_at"] = 1
+            result = self.command("fetch_jira_tasks.py", "--allow-http", expected=1)
+            self.assertTrue(result["errors"])
+            self.assertEqual((self.data / "state.json").read_bytes(), state_before)
+            self.assertEqual(self.command("list_tasks.py")["counts"]["pending"], 2)
+
+    def test_legacy_disallowed_or_missing_status_cannot_be_listed_claimed_or_retried(self):
+        failed_task = snapshot("DEMO-1")
+        self.enqueue(failed_task)
+        claim = self.claim()
+        failure = self.owned("fail_task.py", claim, "--error", "Legacy failure")
+        task = read_json(Path(failure["path"]))
+        task["status"] = {"name": "In Progress"}
+        atomic_json(Path(failure["path"]), task)
+        for key, status in (("DEMO-2", {"name": "Open"}), ("DEMO-3", None)):
+            pending = snapshot(key)
+            pending["status"] = status
+            self.enqueue(pending)
+        self.assertEqual(self.command("list_tasks.py")["status"], "empty")
+        self.assertEqual(self.claim()["status"], "empty")
+        for key in ("DEMO-1", "DEMO-2", "DEMO-3"):
+            self.command("claim_next_task.py", "--issue-key", key, expected=1)
+            self.command("fail_task.py", "--retry", key, expected=1)
+        self.assertFalse(list((self.data / "processing").glob("*.json")))
+
     def test_attachment_size_and_missing_configuration(self):
         with mock_jira() as jira:
             self.env["JIRA_URL"] = jira["base"]
@@ -405,7 +532,7 @@ class QueueTests(unittest.TestCase):
         failed_claim = self.claim()
         self.owned("fail_task.py", failed_claim, "--error", "Synthetic retry reason")
         pending = snapshot("DEMO-2")
-        pending["status"] = {"name": "Open"}
+        pending["status"] = {"name": "TO DO"}
         pending["priority"] = {"name": "High"}
         self.enqueue(pending)
         self.enqueue(snapshot("DEMO-3"))
@@ -415,7 +542,7 @@ class QueueTests(unittest.TestCase):
         tasks = {task["issue_key"]: task for task in listing["tasks"]}
         self.assertEqual(tasks["DEMO-1"]["queue_status"], "failed")
         self.assertEqual(tasks["DEMO-1"]["failure"]["error"], "Synthetic retry reason")
-        self.assertEqual(tasks["DEMO-2"]["jira_status"], "Open")
+        self.assertEqual(tasks["DEMO-2"]["jira_status"], "TO DO")
         self.assertEqual(tasks["DEMO-2"]["priority"], "High")
         self.assertTrue(all(task["selectable"] for task in listing["tasks"]))
         self.assertNotIn("claim_token", json.dumps(listing))

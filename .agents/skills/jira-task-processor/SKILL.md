@@ -48,6 +48,9 @@ Never automatically restore an exclusion or edit `state.json` yourself.
 1. Run `python <scripts>/fetch_jira_tasks.py`. Parse its JSON summary. If it
    exits nonzero or reports errors, report the errors without credentials and
    stop; any successfully downloaded issues remain queued for a later run.
+   Only `NEW`, `PAUSED`, `TO DO`, and `REOPENED` statuses are eligible, even
+   for updated issues, retries, or custom `JIRA_JQL`. A completed search hides
+   cached issues outside the eligible results without changing active claims.
 2. Run `python <scripts>/list_tasks.py` to list pending new/updated versions
    and retryable failures. This only reads the local queue, does not contact
    Jira, and never claims tasks or changes labels. Display a concise table of

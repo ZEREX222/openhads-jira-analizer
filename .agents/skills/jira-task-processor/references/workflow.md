@@ -30,15 +30,28 @@ The default JQL is:
 
 ```text
 assignee = currentUser()
-AND statusCategory != Done
+AND status IN ("NEW", "PAUSED", "TO DO", "REOPENED")
 ORDER BY updated ASC
 ```
 
 For a safe one-issue trial, narrow the query while retaining the assignment filter:
 
 ```powershell
-$env:JIRA_JQL = 'assignee = currentUser() AND statusCategory != Done AND key = DEMO-123 ORDER BY updated ASC'
+$env:JIRA_JQL = 'assignee = currentUser() AND status IN ("NEW", "PAUSED", "TO DO", "REOPENED") AND key = DEMO-123 ORDER BY updated ASC'
 ```
+
+Only `NEW`, `PAUSED`, `TO DO`, and `REOPENED` issues are eligible, including
+updated issues and failed retries. Status names are compared case-insensitively
+with surrounding whitespace ignored. A custom `JIRA_JQL` cannot bypass this
+local status filter; fetch reports rejected keys in `skipped_status_issue_keys`
+without downloading their comments or attachments.
+After a fully enumerated search, cached issues absent from the eligible search
+results are hidden from listing, claiming, and retrying. This also applies when
+assignment or a custom JQL condition changes. Snapshots and failure history are
+preserved, and eligible issues can return after a later fetch. Failed or
+interrupted search pagination does not retire missing cached issues.
+Listing is offline: fetch first to observe Jira status changes. Existing active
+claims remain owned by their original conversation and can finish normally.
 
 Start a **new OpenHands conversation** after installing/updating the skill.
 The repository containing `.agents\skills\jira-task-processor\SKILL.md` must be

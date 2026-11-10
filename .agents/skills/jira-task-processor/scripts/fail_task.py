@@ -34,12 +34,16 @@ def main():
                 raise TaskError("This issue is already processing; do not retry it concurrently.")
             pending = store.root / "inbox" / f"{key}.json"
             if pending.exists():
+                if not store.is_available(read_json(pending)):
+                    raise TaskError("This issue is not eligible for retry; fetch and list tasks again.")
                 return {"status": "already_queued", "issue_key": key,
                         "path": str(pending), "errors": []}
             failure = store.latest_failures().get(key)
             if failure is None:
                 raise TaskError("No failed version exists for this issue.")
             source, task = failure
+            if not store.is_available(task):
+                raise TaskError("This issue is not eligible for retry; fetch and list tasks again.")
             if store.failure_superseded(task):
                 raise TaskError("A successful analysis supersedes this failure; fetch changes instead.")
             prepare_retry(task)
